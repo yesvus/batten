@@ -1,0 +1,16 @@
+[package]
+name = "batten"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Reads the values a terminal status bar shows, in one process per tick"
+license = "MIT"
+repository = "https://github.com/yesvus/batten"
+keywords = ["statusline", "tmux", "metrics", "sysinfo"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+
+[profile.release]
+lto = true
+strip = true
