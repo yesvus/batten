@@ -185,6 +185,169 @@ fn disk_use_pct(df_output: &str) -> Option<String> {
     None
 }
 
+fn battery_sysfs(sysfs: &std::path::Path) -> Option<(u64, bool)> {
+    let supply = sysfs.join("class/power_supply");
+    let entries = std::fs::read_dir(&supply).ok()?;
+    let mut pct: Option<u64> = None;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("BAT") {
+            continue;
+        }
+        if let Some(v) = hottest_in_file(&entry.path().join("capacity")) {
+            pct = Some(pct.map_or(v, |p: u64| p.min(v)));
+        }
+    }
+    let pct = pct?;
+    let mut charging = false;
+    if let Ok(entries) = std::fs::read_dir(&supply) {
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("BAT") {
+                continue;
+            }
+            if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+                if status.lines().any(|l| l.trim() == "Charging") {
+                    charging = true;
+                    break;
+                }
+            }
+        }
+    }
+    Some((pct, charging))
+}
+
+fn battery_pmset() -> Option<(u64, bool)> {
+    let out = temp_cmd("pmset", &["-g", "batt"])?;
+    let mut pct = None;
+    for line in out.lines() {
+        if line.contains("InternalBattery") {
+            let digits: String = line
+                .split_whitespace()
+                .nth(2)
+                .unwrap_or("")
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            pct = digits.parse().ok();
+            break;
+        }
+    }
+    let pct: u64 = pct?;
+    let charging = !(out.contains("discharging") || out.contains("not charging"));
+    Some((pct, charging))
+}
+
+fn battery_cache_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("batten").join("battery"))
+}
+
+fn termux_battery() -> Option<(u64, bool)> {
+    // timeout keeps a hung android broadcast from stalling the tick
+    let status = if which("timeout") {
+        std::process::Command::new("timeout").arg("3").arg("termux-battery-status").output().ok()?
+    } else {
+        std::process::Command::new("termux-battery-status").output().ok()?
+    };
+    if !status.status.success() {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&status.stdout).into_owned();
+    let pct = out.split("\"percentage\"").nth(1).and_then(|s| {
+        s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().ok()
+    })?;
+    let charging = out.contains("\"status\"") && out.split("\"status\"").nth(1).is_some_and(|s| s.contains("CHARGING"));
+    Some((pct, charging))
+}
+
+fn now_secs() -> Option<u64> {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+fn battery_termux_cached() -> Option<(u64, bool)> {
+    let cache = battery_cache_path()?;
+    let now = now_secs()?;
+    let cached: Option<(u64, u64, bool)> = std::fs::read_to_string(&cache).ok().and_then(|s| {
+        let mut parts = s.split_whitespace();
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()? == "1"))
+    });
+    if let Some((stamp, _, _)) = cached {
+        if now.wrapping_sub(stamp) < 60 {
+            return cached.map(|(_, p, c)| (p, c));
+        }
+    }
+    // single-flight refresh: a lock newer than the api timeout means another
+    // caller is already refreshing, so serve the last answer instead
+    let lock = cache.with_extension("lock");
+    let locked = std::fs::read_to_string(&lock).ok().and_then(|s| s.trim().parse::<u64>().ok()).is_some_and(|t| now.wrapping_sub(t) <= 10);
+    if !locked {
+        let _ = std::fs::create_dir_all(cache.parent()?);
+        if std::fs::OpenOptions::new().write(true).create_new(true).open(&lock).and_then(|mut f| std::io::Write::write_all(&mut f, now.to_string().as_bytes())).is_ok() {
+            let got = termux_battery();
+            let _ = std::fs::remove_file(&lock);
+            if let Some((pct, charging)) = got {
+                let _ = std::fs::write(&cache, format!("{now} {pct} {}", charging as u8));
+                return Some((pct, charging));
+            }
+        }
+        if std::fs::read_to_string(&lock).ok().and_then(|s| s.trim().parse::<u64>().ok()).is_some_and(|t| now.wrapping_sub(t) > 10) {
+            let _ = std::fs::remove_file(&lock);
+        }
+    }
+    cached.and_then(|(stamp, p, c)| (now.wrapping_sub(stamp) < 600).then_some((p, c)))
+}
+
+fn battery() -> Option<(u64, bool)> {
+    if let Some(found) = battery_sysfs(&sysfs_root()) {
+        return Some(found);
+    }
+    if let Some(found) = battery_pmset() {
+        return Some(found);
+    }
+    if which("termux-battery-status") {
+        if let Some(found) = battery_termux_cached() {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn which(program: &str) -> bool {
+    std::env::var("PATH").is_ok_and(|paths| {
+        std::env::split_paths(&paths).any(|d| d.join(program).is_file())
+    })
+}
+
+fn bat_icon(pct: u64, charging: bool) -> &'static str {
+    if charging {
+        return "󰂄";
+    }
+    if pct >= 100 {
+        "󰁹"
+    } else if pct >= 90 {
+        "󰂂"
+    } else if pct >= 80 {
+        "󰂁"
+    } else if pct >= 70 {
+        "󰂀"
+    } else if pct >= 60 {
+        "󰁿"
+    } else if pct >= 50 {
+        "󰁾"
+    } else if pct >= 40 {
+        "󰁽"
+    } else if pct >= 30 {
+        "󰁼"
+    } else if pct >= 20 {
+        "󰁻"
+    } else {
+        "󰁺"
+    }
+}
+
 fn disk() -> Option<String> {
     let out = std::process::Command::new("df").arg("-P").args(disk_paths()).output().ok()?;
     if !out.status.success() {
@@ -306,11 +469,15 @@ fn main() {
     };
 
     let mut out = String::new();
+    // one battery read per tick even when both parts are wanted
+    let bat = (wanted.iter().any(|k| *k == "bat" || *k == "bat_icon")).then(battery).flatten();
     for key in wanted {
         let value = match key {
             "cpu" => cpu(),
             "temp" => temp(),
             "disk" => disk(),
+            "bat" => bat.map(|(pct, _)| pct.to_string()),
+            "bat_icon" => bat.map(|(pct, charging)| format!("{} ", bat_icon(pct, charging))),
             "ram" => ram(),
             "load" => load(),
             _ => None,
@@ -336,6 +503,45 @@ mod tests {
         let same = [100, 0, 100, 800, 0, 0, 0, 0];
         assert!(cpu_usage(same, same).is_none());
         assert!(cpu_usage([200, 0, 200, 800, 0, 0, 0, 0], [100, 0, 100, 900, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn battery_reads_lowest_sysfs_capacity() {
+        let dir = std::env::temp_dir().join(format!("batten-bat-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("class/power_supply/BAT0")).unwrap();
+        std::fs::create_dir_all(dir.join("class/power_supply/BAT1")).unwrap();
+        std::fs::write(dir.join("class/power_supply/BAT0/capacity"), "80\n").unwrap();
+        std::fs::write(dir.join("class/power_supply/BAT0/status"), "Charging\n").unwrap();
+        std::fs::write(dir.join("class/power_supply/BAT1/capacity"), "65\n").unwrap();
+        std::fs::write(dir.join("class/power_supply/BAT1/status"), "Discharging\n").unwrap();
+        assert_eq!(battery_sysfs(&dir), Some((65, true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn battery_empty_without_bat_dirs() {
+        let dir = std::env::temp_dir().join(format!("batten-bat-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("class/power_supply")).unwrap();
+        assert_eq!(battery_sysfs(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bat_icon_thresholds_match_shell_backend() {
+        assert_eq!(bat_icon(50, true), "󰂄");
+        assert_eq!(bat_icon(100, false), "󰁹");
+        assert_eq!(bat_icon(95, false), "󰂂");
+        assert_eq!(bat_icon(85, false), "󰂁");
+        assert_eq!(bat_icon(75, false), "󰂀");
+        assert_eq!(bat_icon(65, false), "󰁿");
+        assert_eq!(bat_icon(55, false), "󰁾");
+        assert_eq!(bat_icon(45, false), "󰁽");
+        assert_eq!(bat_icon(35, false), "󰁼");
+        assert_eq!(bat_icon(25, false), "󰁻");
+        assert_eq!(bat_icon(15, false), "󰁺");
+        assert!(bat_icon(50, false).chars().all(|c| ('\u{f007a}'..='\u{f0084}').contains(&c)));
     }
 
     #[test]
