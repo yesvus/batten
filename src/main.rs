@@ -163,6 +163,36 @@ fn temp_macos() -> Option<u64> {
     None
 }
 
+fn disk_paths() -> Vec<String> {
+    if let Ok(path) = std::env::var("BATTEN_DISK_PATH") {
+        if !path.is_empty() {
+            return vec![path];
+        }
+    }
+    if cfg!(target_os = "macos") {
+        return vec!["/System/Volumes/Data".to_string(), "/".to_string()];
+    }
+    vec!["/".to_string()]
+}
+
+fn disk_use_pct(df_output: &str) -> Option<String> {
+    for line in df_output.lines().skip(1) {
+        let field = line.split_whitespace().nth(4)?;
+        if field.len() > 1 && field.ends_with('%') && field[..field.len() - 1].chars().all(|c| c.is_ascii_digit()) {
+            return Some(field.to_string());
+        }
+    }
+    None
+}
+
+fn disk() -> Option<String> {
+    let out = std::process::Command::new("df").arg("-P").args(disk_paths()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    disk_use_pct(&String::from_utf8_lossy(&out.stdout))
+}
+
 fn temp() -> Option<String> {
     if let Some(v) = temp_sysfs(&sysfs_root()) {
         return Some(v.to_string());
@@ -280,6 +310,7 @@ fn main() {
         let value = match key {
             "cpu" => cpu(),
             "temp" => temp(),
+            "disk" => disk(),
             "ram" => ram(),
             "load" => load(),
             _ => None,
@@ -305,6 +336,18 @@ mod tests {
         let same = [100, 0, 100, 800, 0, 0, 0, 0];
         assert!(cpu_usage(same, same).is_none());
         assert!(cpu_usage([200, 0, 200, 800, 0, 0, 0, 0], [100, 0, 100, 900, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn disk_takes_first_use_pct_row() {
+        let df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 100 63 37 63% /\n";
+        assert_eq!(disk_use_pct(df).as_deref(), Some("63%"));
+    }
+
+    #[test]
+    fn disk_skips_header_only_or_missing_pct() {
+        assert_eq!(disk_use_pct("Filesystem 1024-blocks Used Available Capacity Mounted on\n"), None);
+        assert_eq!(disk_use_pct(""), None);
     }
 
     #[test]
