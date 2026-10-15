@@ -45,7 +45,7 @@ empty.
 | `bat` | sysfs, `pmset` on macOS, `rish` on Android |
 | `bat_icon` | a glyph derived from `bat` and the charging flag |
 
-`ram` and `load` are implemented. The rest print empty.
+`cpu`, `ram` and `load` are implemented. The rest print empty.
 
 A value that cannot be read is printed empty. Nothing is guessed and nothing
 exits non-zero for a missing source, so one unreadable value never blanks a bar.
