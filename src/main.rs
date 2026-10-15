@@ -40,6 +40,141 @@ fn cpu_usage(old: [u64; 8], now: [u64; 8]) -> Option<f64> {
     (dt > 0).then(|| db as f64 * 100.0 / dt as f64)
 }
 
+fn sysfs_root() -> std::path::PathBuf {
+    std::env::var("BATTEN_SYSFS")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/sys"))
+}
+
+fn hottest_in_file(path: &std::path::Path) -> Option<u64> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut digits = String::new();
+    for ch in content.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse().ok()
+}
+
+fn hottest_in_dir(dir: &std::path::Path, prefix: &str, leaf: &str) -> Option<u64> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut hot: Option<u64> = None;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(prefix) {
+            continue;
+        }
+        if let Some(v) = hottest_in_file(&entry.path().join(leaf)) {
+            hot = Some(hot.map_or(v, |h: u64| h.max(v)));
+        }
+    }
+    hot
+}
+
+fn temp_sysfs(sysfs: &std::path::Path) -> Option<u64> {
+    let zones = hottest_in_dir(&sysfs.join("class/thermal"), "thermal_zone", "temp");
+    // hwmon temp files live directly in hwmonN/, one per sensor
+    let mut hwmon_hot: Option<u64> = None;
+    if let Ok(entries) = std::fs::read_dir(sysfs.join("class/hwmon")) {
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("hwmon") {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(entry.path()) {
+                for file in files.flatten() {
+                    let name = file.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("temp") && name.ends_with("_input") {
+                        if let Some(v) = hottest_in_file(&file.path()) {
+                            hwmon_hot = Some(hwmon_hot.map_or(v, |h: u64| h.max(v)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match (zones, hwmon_hot) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+fn temp_cmd(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn first_float(text: &str) -> Option<f64> {
+    let mut start: Option<usize> = None;
+    for (i, ch) in text.char_indices() {
+        if ch.is_ascii_digit() || ch == '.' {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start {
+            return text[s..i].parse().ok();
+        }
+    }
+    start.and_then(|s| text[s..].parse().ok())
+}
+
+fn temp_macos() -> Option<u64> {
+    if let Some(out) = temp_cmd("macmon", &["pipe", "-i", "100"]) {
+        if let Some(line) = out.lines().next() {
+            if let Some(idx) = line.find("\"cpu_temp_avg\"") {
+                if let Some(v) = first_float(&line[idx..]) {
+                    return Some((v * 1000.0) as u64);
+                }
+            }
+        }
+    }
+    if let Some(out) = temp_cmd("smc", &["-k", "TC0P", "-r"]) {
+        if let Some(v) = first_float(&out) {
+            return Some((v * 1000.0) as u64);
+        }
+    }
+    if let Some(out) = temp_cmd("osx-cpu-temp", &["-c"]) {
+        let digits: String = out.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+        if let Ok(v) = digits.parse::<f64>() {
+            return Some((v * 1000.0) as u64);
+        }
+    }
+    if let Some(out) = temp_cmd("ioreg", &["-r", "-k", "BatteryData", "-d", "2"]) {
+        for line in out.lines() {
+            if let Some(idx) = line.find("\"Temperature\"=") {
+                let digits: String = line[idx..]
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(v) = digits.parse::<u64>() {
+                    return Some(v * 10);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn temp() -> Option<String> {
+    if let Some(v) = temp_sysfs(&sysfs_root()) {
+        return Some(v.to_string());
+    }
+    if cfg!(target_os = "macos") {
+        if let Some(v) = temp_macos() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
 fn cpu_cache_path() -> Option<std::path::PathBuf> {
     if let Ok(path) = std::env::var("BATTEN_CPU_CACHE") {
         if !path.is_empty() {
@@ -144,6 +279,7 @@ fn main() {
     for key in wanted {
         let value = match key {
             "cpu" => cpu(),
+            "temp" => temp(),
             "ram" => ram(),
             "load" => load(),
             _ => None,
@@ -169,6 +305,29 @@ mod tests {
         let same = [100, 0, 100, 800, 0, 0, 0, 0];
         assert!(cpu_usage(same, same).is_none());
         assert!(cpu_usage([200, 0, 200, 800, 0, 0, 0, 0], [100, 0, 100, 900, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn temp_picks_hottest_sysfs_sensor() {
+        let dir = std::env::temp_dir().join(format!("batten-temp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("class/thermal/thermal_zone0")).unwrap();
+        std::fs::create_dir_all(dir.join("class/thermal/thermal_zone1")).unwrap();
+        std::fs::create_dir_all(dir.join("class/hwmon/hwmon0")).unwrap();
+        std::fs::write(dir.join("class/thermal/thermal_zone0/temp"), "41000\n").unwrap();
+        std::fs::write(dir.join("class/thermal/thermal_zone1/temp"), "48000\n").unwrap();
+        std::fs::write(dir.join("class/hwmon/hwmon0/temp1_input"), "45200\n").unwrap();
+        assert_eq!(temp_sysfs(&dir), Some(48000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_empty_without_sensors() {
+        let dir = std::env::temp_dir().join(format!("batten-temp-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("class/thermal")).unwrap();
+        assert_eq!(temp_sysfs(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
