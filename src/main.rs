@@ -412,17 +412,19 @@ fn cpu_with_paths(proc_stat: &std::path::Path, cache: &std::path::Path) -> Optio
 }
 
 fn cpu() -> Option<String> {
-    cpu_with_paths(
-        &std::path::PathBuf::from(
-            std::env::var("BATTEN_PROC").unwrap_or_else(|_| "/proc".to_string()),
-        )
-        .join("stat"),
-        &cpu_cache_path()?,
-    )
+    cpu_with_paths(&proc_root().join("stat"), &cpu_cache_path()?)
 }
 
-fn ram() -> Option<String> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+fn proc_root() -> std::path::PathBuf {
+    std::env::var("BATTEN_PROC")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc"))
+}
+
+fn ram_from(meminfo: &std::path::Path) -> Option<String> {
+    let meminfo = std::fs::read_to_string(meminfo).ok()?;
     let field = |name: &str| -> Option<u64> {
         meminfo
             .lines()
@@ -434,14 +436,22 @@ fn ram() -> Option<String> {
     (total > 0).then(|| format!("{:.1}", (total - avail) as f64 * 100.0 / total as f64))
 }
 
-fn load() -> Option<String> {
-    let line = std::fs::read_to_string("/proc/loadavg").ok()?;
+fn ram() -> Option<String> {
+    ram_from(&proc_root().join("meminfo"))
+}
+
+fn load_from(loadavg: &std::path::Path) -> Option<String> {
+    let line = std::fs::read_to_string(loadavg).ok()?;
     let mut parts = line.split_whitespace().take(3);
     let mut out = String::new();
     for _ in 0..3 {
         let _ = write!(out, "{} ", parts.next()?);
     }
     Some(out.trim_end().to_string())
+}
+
+fn load() -> Option<String> {
+    load_from(&proc_root().join("loadavg"))
 }
 
 fn main() {
@@ -542,6 +552,28 @@ mod tests {
         assert_eq!(bat_icon(25, false), "󰁻");
         assert_eq!(bat_icon(15, false), "󰁺");
         assert!(bat_icon(50, false).chars().all(|c| ('\u{f007a}'..='\u{f0084}').contains(&c)));
+    }
+
+    #[test]
+    fn ram_reads_proc_root_meminfo() {
+        let dir = std::env::temp_dir().join(format!("batten-ram-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meminfo"), "MemTotal:       4000 kB\nMemAvailable:   1000 kB\n").unwrap();
+        assert_eq!(ram_from(&dir.join("meminfo")).as_deref(), Some("75.0"));
+        assert!(ram_from(&dir.join("missing")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reads_proc_root_loadavg() {
+        let dir = std::env::temp_dir().join(format!("batten-load-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("loadavg"), "0.23 0.65 2.77 2/1234 5678\n").unwrap();
+        assert_eq!(load_from(&dir.join("loadavg")).as_deref(), Some("0.23 0.65 2.77"));
+        assert!(load_from(&dir.join("missing")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
